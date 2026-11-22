@@ -20,7 +20,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{FromRequest, Request, State};
+use axum::extract::{FromRequest, Path as AxumPath, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -190,14 +190,19 @@ pub async fn app() -> Result<Router, StartupError> {
 ///
 /// Routes: `GET /health`, the x-auth defaults (`POST /sign-in`, `POST /sign-out`,
 /// `GET /session`, ...), `POST /sign-up`, `POST /roles`, `POST /permissions`,
-/// `POST /groups`, `POST /memberships`, and `GET /users`, `GET /groups`,
-/// `GET /permissions`.
+/// `POST /groups`, `POST /groups/{id}/members`,
+/// `DELETE /groups/{id}/members/{membership_id}`, `POST /memberships`,
+/// `POST /invitations`, `POST /invitations/accept`, `POST /email/verify/request`,
+/// `POST /email/verify`, `POST /password/reset/request`, `POST /password/reset`,
+/// and `GET /users`, `GET /groups`, `GET /permissions`.
 ///
-/// The five write routes require a live session cookie; an anonymous call is
-/// refused with `401` before its body is read, even when the origin and CSRF
-/// pair are valid. The three lists require the same session. The x-auth
-/// defaults keep their own rules, so `POST /sign-in` stays available to an
-/// anonymous caller that presents a valid origin and CSRF pair.
+/// Every state-changing route requires a live session cookie, except
+/// `POST /sign-in`. An anonymous call is refused with `401` before its body is
+/// read, even when the origin and CSRF pair are valid. That covers the group
+/// member add and remove, the invitation issue and accept, email verification,
+/// password reset, and sign-out. The three lists require the same session.
+/// `POST /sign-in` stays available to an anonymous caller that presents a valid
+/// origin and CSRF pair.
 ///
 /// `/health` remains the only vault claim, and it is always false. The
 /// `embed-ui` fallback is set after these routes, so it answers only paths no
@@ -235,10 +240,19 @@ pub async fn app_with(settings: Settings) -> Result<Router, StartupError> {
         // Tokens this application never issues are discarded. They are not logged.
         .on_proof(|_email, _kind, _token| {})
         .sign_up(create_user::<SqliteStore>)
+        .sign_out(sign_out::<SqliteStore>)
         .role(create_role::<SqliteStore>)
         .permission(create_permission::<SqliteStore>)
         .group(create_group::<SqliteStore>)
+        .group_member(add_group_member::<SqliteStore>)
+        .group_member_remove(remove_group_member::<SqliteStore>)
         .memberships(create_membership::<SqliteStore>)
+        .invitations(issue_invitation::<SqliteStore>)
+        .accept_invitation(accept_invitation::<SqliteStore>)
+        .email_verify_request(email_verify_request::<SqliteStore>)
+        .email_verify(email_verify::<SqliteStore>)
+        .password_reset_request(password_reset_request::<SqliteStore>)
+        .password_reset(password_reset::<SqliteStore>)
         .into_router();
 
     let lists = Router::new()
@@ -264,11 +278,18 @@ struct Shared {
     key: Zeroizing<[u8; KEY_LEN]>,
 }
 
-/// Ensure the store has a tenant and exactly one bootstrapped administrator.
+/// Ensure the store has a tenant and a bootstrapped administrator with active
+/// membership and the admin role.
 ///
 /// The administrator variables are consulted only when `auth_user` is empty.
 /// The password is hashed on a blocking executor; neither it nor the hash is
 /// printed.
+///
+/// A store that already has a user skips the variables, but not the rest of the
+/// setup: if the first live user exists without an active membership or without
+/// the admin role, those steps are finished on this start. A failed start after
+/// `sign_up` therefore recovers instead of leaving an administrator that cannot
+/// act. No second user is created.
 async fn bootstrap(
     store: &SqliteStore,
     settings: &Settings,
@@ -302,6 +323,21 @@ async fn bootstrap(
         .read::<i64>("n")
         .map_err(|_| StartupError::Query)?;
     if users > 0 {
+        // The bootstrap administrator is the first live user. If an earlier start
+        // stopped after `sign_up`, this is the user it created; completing the
+        // membership and role is idempotent on a store that finished setup.
+        let user = provider
+            .fetch_first_async(
+                "SELECT id FROM auth_user WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
+                QueryOptions::new(),
+            )
+            .await
+            .map_err(|_| StartupError::Query)?
+            .map(|row| read_id(&row).map_err(|_| StartupError::Query))
+            .transpose()?;
+        if let Some(user) = user {
+            ensure_administrator_access(store, tenant, user, key).await?;
+        }
         return Ok(tenant);
     }
 
@@ -318,19 +354,40 @@ async fn bootstrap(
         .map_err(|_| StartupError::Task)?
         .map_err(StartupError::Auth)?;
 
-    let auth = Auth::new(store, key, Policy::default());
-    let user = auth
+    let user = Auth::new(store, key, Policy::default())
         .sign_up(tenant, &email, &hash, Timestamp::now_utc())
         .await?;
-    let membership = auth
-        .create_membership(
-            tenant,
-            user.id,
-            MembershipStatus::Active,
-            Timestamp::now_utc(),
-        )
-        .await?;
-    let role = provider
+    ensure_administrator_access(store, tenant, user.id, key).await?;
+    Ok(tenant)
+}
+
+/// Give `user` an active membership in `tenant` and the tenant's `admin` role.
+///
+/// Repeating this is safe: an existing active membership is kept, an inactive
+/// one is made active, and the role assignment ignores a duplicate. Neither the
+/// password nor its hash is read here, and nothing is printed.
+async fn ensure_administrator_access(
+    store: &SqliteStore,
+    tenant: Id,
+    user: Id,
+    key: [u8; KEY_LEN],
+) -> Result<(), StartupError> {
+    let auth = Auth::new(store, key, Policy::default());
+    let now = Timestamp::now_utc();
+    let membership = match auth.membership(tenant, user).await {
+        Ok(membership) if membership.status.is_authority() => membership,
+        Ok(membership) => {
+            auth.set_membership_status(membership.id, MembershipStatus::Active, now)
+                .await?
+        }
+        Err(AuthError::NotFound) => {
+            auth.create_membership(tenant, user, MembershipStatus::Active, now)
+                .await?
+        }
+        Err(error) => return Err(StartupError::Auth(error)),
+    };
+    let role = store
+        .provider()
         .fetch_first_async(
             "SELECT id FROM auth_role WHERE tenant_id=? AND name='admin'",
             QueryOptions::new().bind(id_parameter(tenant)),
@@ -339,9 +396,8 @@ async fn bootstrap(
         .map_err(|_| StartupError::Query)?
         .ok_or(StartupError::Query)
         .and_then(|row| read_id(&row).map_err(|_| StartupError::Query))?;
-    auth.assign_role(membership.id, role, Timestamp::now_utc())
-        .await?;
-    Ok(tenant)
+    auth.assign_role(membership.id, role, now).await?;
+    Ok(())
 }
 
 /// Read the bootstrap administrator from the environment.
@@ -489,7 +545,12 @@ fn auth_error(error: AuthError) -> Response {
 }
 
 /// Read one named cookie from the request.
-fn cookie<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+///
+/// The cookie header is untrusted text. A missing or non-text header, a pair
+/// without `=`, and a name that does not match all return `None`; nothing is
+/// indexed past the end of the value.
+#[must_use]
+pub fn cookie<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     request
         .headers()
         .get(header::COOKIE)?
@@ -503,7 +564,12 @@ fn cookie<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
 }
 
 /// Whether `origin` is one of the loopback names on a valid port.
-fn origin_matches(host: &str, origin: &str) -> bool {
+///
+/// Both values are untrusted text. The comparison is a prefix match followed by
+/// an optional numeric port, so an empty host, a non-numeric port, a port above
+/// `u16::MAX`, or trailing text after the port is refused.
+#[must_use]
+pub fn origin_matches(host: &str, origin: &str) -> bool {
     origin.strip_prefix(host).is_some_and(|rest| {
         rest.is_empty()
             || rest.strip_prefix(':').is_some_and(|port| {
@@ -751,6 +817,152 @@ async fn create_membership<S: AuthStore + 'static>(
     }
 }
 
+/// `POST /sign-out` behind a live session.
+///
+/// The x-auth default revokes a presented session and answers `204` even when
+/// none is presented. This wrapper refuses the anonymous request with `401`
+/// first, so no state-changing route but `POST /sign-in` is open to it.
+async fn sign_out<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::sign_out::<S>(State(state), request).await
+}
+
+/// `POST /groups/{id}/members` behind a live session.
+///
+/// The x-auth default checks the origin and CSRF pair only. This wrapper adds
+/// the session check its sibling write routes already have.
+async fn add_group_member<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    AxumPath(group): AxumPath<String>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::add_group_member::<S>(State(state), AxumPath(group), request)
+        .await
+}
+
+/// `DELETE /groups/{id}/members/{membership_id}` behind a live session.
+async fn remove_group_member<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    AxumPath(ids): AxumPath<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::remove_group_member::<S>(State(state), AxumPath(ids), request)
+        .await
+}
+
+/// `POST /invitations` behind a live session.
+async fn issue_invitation<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::issue_invitation::<S>(State(state), request).await
+}
+
+/// `POST /invitations/accept` behind a live session.
+async fn accept_invitation<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::accept_invitation::<S>(State(state), request).await
+}
+
+/// `POST /email/verify/request` behind a live session.
+async fn email_verify_request<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::email_verify_request::<S>(State(state), request).await
+}
+
+/// `POST /email/verify` behind a live session.
+async fn email_verify<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::email_verify::<S>(State(state), request).await
+}
+
+/// `POST /password/reset/request` behind a live session.
+async fn password_reset_request<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::password_reset_request::<S>(State(state), request).await
+}
+
+/// `POST /password/reset` behind a live session.
+async fn password_reset<S: AuthStore + 'static>(
+    State(state): State<AuthState<S>>,
+    request: Request,
+) -> Response {
+    if let Err(response) = guard(&state, &request) {
+        return response;
+    }
+    let token = session_token(&request, state.session_cookie());
+    if let Err(response) = require_session(&state, token).await {
+        return response;
+    }
+    neotales_x_auth_axum::default::password_reset::<S>(State(state), request).await
+}
+
 /// A stored identifier as a SQLite parameter.
 fn id_parameter(value: Id) -> Parameter {
     Parameter::new(DbType::Bytes, Value::Bytes(value.as_bytes().to_vec()))
@@ -877,7 +1089,7 @@ async fn list_permissions(State(shared): State<Arc<Shared>>, request: Request) -
 
 #[cfg(test)]
 mod tests {
-    use super::{KEY_LEN, decode_hex, load_or_create_key};
+    use super::{KEY_LEN, Settings, app_with, decode_hex, load_or_create_key};
 
     #[test]
     fn a_sixty_four_character_hex_key_decodes() {
@@ -903,5 +1115,80 @@ mod tests {
         assert_eq!(first, second);
         let stored = std::fs::read(directory.path().join("auth.key")).expect("key file");
         assert_eq!(stored.len(), KEY_LEN);
+    }
+
+    /// An anonymous caller with a valid origin and CSRF pair still gets `401`
+    /// from every state-changing route the task names, because a session is
+    /// missing. `POST /sign-in` is the only state-changing route left open.
+    #[tokio::test]
+    async fn anonymous_state_changing_routes_are_unauthorized_with_a_csrf_pair() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode, header};
+        use neotales_x_auth_core::Id;
+        use tower::ServiceExt as _;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let app = app_with(
+            Settings::new(directory.path().join("nav.sqlite"))
+                .with_key([0x11; KEY_LEN])
+                .with_admin("admin@example.test", "correct horse battery staple"),
+        )
+        .await
+        .expect("app");
+
+        // A safe GET hands the page the CSRF cookie the POSTs must echo.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/session")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let csrf = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|text| text.strip_prefix("neotales.csrf="))
+            .and_then(|rest| rest.split(';').next())
+            .expect("csrf cookie")
+            .to_owned();
+        assert_ne!(csrf, "");
+
+        let group = Id::now_v7();
+        let membership = Id::now_v7();
+        let routes = [
+            (Method::POST, format!("/groups/{group}/members")),
+            (
+                Method::DELETE,
+                format!("/groups/{group}/members/{membership}"),
+            ),
+            (Method::POST, "/password/reset".to_owned()),
+            (Method::POST, "/password/reset/request".to_owned()),
+            (Method::POST, "/email/verify".to_owned()),
+            (Method::POST, "/email/verify/request".to_owned()),
+            (Method::POST, "/invitations".to_owned()),
+            (Method::POST, "/invitations/accept".to_owned()),
+            (Method::POST, "/sign-out".to_owned()),
+        ];
+        for (method, path) in routes {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(&path)
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, format!("neotales.csrf={csrf}"))
+                .header("x-csrf-token", &csrf)
+                .body(Body::from("{}"))
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} needs a session"
+            );
+        }
     }
 }

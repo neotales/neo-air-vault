@@ -286,3 +286,63 @@ async fn a_store_with_a_user_ignores_the_administrator_settings() {
     let (status, _) = other.sign_in("other@example.test", &other_password).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn a_start_that_stopped_after_sign_up_finishes_the_administrator() {
+    use neotales_x_auth::{Auth, Policy, hash_password};
+    use neotales_x_auth_core::{AuthStore as _, Id, Timestamp};
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let database = directory.path().join("nav.sqlite");
+    let key = random_key();
+    let admin_password = random_password();
+
+    // A first start that stopped after `sign_up`: the account exists, but the
+    // membership and the admin role were never written.
+    {
+        let store = neotales_x_auth_store_sqlite::open(&database)
+            .await
+            .expect("store");
+        let tenant = Id::now_v7();
+        store
+            .create_tenant(tenant, "navault", Timestamp::now_utc())
+            .await
+            .expect("tenant");
+        let hash = hash_password(admin_password.as_bytes()).expect("hash");
+        Auth::new(&store, key, Policy::default())
+            .sign_up(tenant, "admin@example.test", &hash, Timestamp::now_utc())
+            .await
+            .expect("user");
+    }
+
+    // The next start finishes the membership and the role; it does not create a
+    // second user, and it does not need the administrator password again.
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("second@example.test", random_password()),
+    )
+    .await
+    .expect("the application starts");
+
+    let mut client = Client::new(router);
+    client.issue_csrf().await;
+    let (status, body) = client.sign_in("admin@example.test", &admin_password).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = client.get("/users").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = users(&body);
+    assert_eq!(listed.len(), 1, "no second user is created");
+
+    // A second membership for the same user is a conflict, which proves the
+    // start completed the missing membership and the caller may act.
+    let user_id = listed[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("user id");
+    let (status, body) = client
+        .post("/memberships", &format!(r#"{{"user_id":"{user_id}"}}"#))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}

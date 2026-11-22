@@ -1,0 +1,24 @@
+[package]
+name = "navault-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+axum = "0.8"
+libfuzzer-sys = "0.4"
+navault-server = { path = "../server" }
+
+# Its own workspace so the root `cargo test --workspace` does not try to build
+# the fuzz binaries on the stable toolchain.
+[workspace]
+
+[[bin]]
+name = "cookie_origin"
+path = "fuzz_targets/cookie_origin.rs"
+test = false
+doc = false
+bench = false
