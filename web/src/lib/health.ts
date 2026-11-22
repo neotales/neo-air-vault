@@ -1,11 +1,11 @@
-/** Loopback API when the page is not already served by navault-server. */
-export const API_ORIGIN = 'http://127.0.0.1:8787';
-
 export type Health = { kind: 'down' } | { kind: 'mismatch' } | { kind: 'not-a-vault' };
 
 /**
  * Accept only the health contract: `{ "status": "ok", "vault": false }`.
  * Any other shape, including a claim that a vault exists, is a mismatch.
+ *
+ * Callers request `/health` as a same-origin relative path; Vite proxies it in
+ * development and `navault-server` serves the page itself in the embedded build.
  */
 export function parseHealth(value: unknown): Exclude<Health, { kind: 'down' }> {
 	if (typeof value !== 'object' || value === null || Array.isArray(value)) {
