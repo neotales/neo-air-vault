@@ -205,8 +205,9 @@ pub async fn app() -> Result<Router, StartupError> {
 /// origin and CSRF pair.
 ///
 /// `/health` remains the only vault claim, and it is always false. The
-/// `embed-ui` fallback is set after these routes, so it answers only paths no
-/// route matched.
+/// `embed-ui` file handler is set after these routes, so it answers only paths
+/// no route matched. It serves a built file, or `index.html` for `/` and an
+/// empty path. Any other missing path is 404.
 ///
 /// # Errors
 ///

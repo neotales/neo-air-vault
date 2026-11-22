@@ -44,8 +44,10 @@ impl Health {
 /// Routes this process serves without a store. `/health` is always present.
 ///
 /// The `embed-ui` feature also serves the built web client. That client is
-/// not a vault. [`app`] mounts this health route together with the auth routes
-/// and sets the UI fallback last, so it answers only unmatched paths.
+/// not a vault. The page is one route: `/` and an empty path serve
+/// `index.html`. Any other missing path, including `/secrets`, is 404.
+/// [`app`] mounts this health route together with the auth routes and sets
+/// the file handler last, so a matched route still wins.
 pub fn router() -> Router {
     let router = Router::new().route("/health", get(health));
     #[cfg(feature = "embed-ui")]
@@ -62,14 +64,16 @@ mod ui {
 
     static UI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/build");
 
+    /// Serve one built file.
+    ///
+    /// `/` and an empty path are the page (`index.html`). An existing file in
+    /// the build is served as itself. Any other path is 404. This is not a
+    /// client-side router: `/secrets` is not the page.
     pub async fn file(uri: Uri) -> Response {
         let path = uri.path().trim_start_matches('/');
         let path = if path.is_empty() { "index.html" } else { path };
         if let Some(file) = UI.get_file(path) {
             return response(StatusCode::OK, path, file.contents());
-        }
-        if let Some(index) = UI.get_file("index.html") {
-            return response(StatusCode::OK, "index.html", index.contents());
         }
         Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -185,5 +189,28 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "embed-ui")]
+    #[tokio::test]
+    async fn root_serves_the_page() {
+        for uri in ["/", "/index.html"] {
+            let response = router()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let kind = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .expect("content type");
+            assert_eq!(kind, "text/html; charset=utf-8");
+        }
     }
 }
