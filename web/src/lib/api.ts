@@ -13,7 +13,8 @@
  *
  * Response bodies are never kept on an error and never rendered wholesale: a
  * body can echo what was sent, and every list is projected onto a whitelist of
- * non-secret fields.
+ * non-secret fields. List routes return a wrapped object (`{ users }`,
+ * `{ groups }`, `{ permissions }`), not a bare array.
  */
 
 /** Cookie the server sets for this page to copy into {@link CSRF_HEADER}. */
@@ -145,9 +146,20 @@ function parseUser(value: unknown): User {
 	return { id, email };
 }
 
+/**
+ * Read the named array out of a list body. A bare array is not the contract.
+ * Fields beside the array are ignored, so a secret column cannot leak through
+ * an unexpected sibling.
+ */
+function unwrapList(value: unknown, key: string): unknown[] {
+	if (!isRecord(value)) throw new ContractError();
+	const list = value[key];
+	if (!Array.isArray(list)) throw new ContractError();
+	return list;
+}
+
 function parseUsers(value: unknown): User[] {
-	if (!Array.isArray(value)) throw new ContractError();
-	return value.map(parseUser);
+	return unwrapList(value, 'users').map(parseUser);
 }
 
 function parseNamed(value: unknown): Named {
@@ -158,9 +170,8 @@ function parseNamed(value: unknown): Named {
 	return { id, name };
 }
 
-function parseNamedList(value: unknown): Named[] {
-	if (!Array.isArray(value)) throw new ContractError();
-	return value.map(parseNamed);
+function parseNamedList(value: unknown, key: 'groups' | 'permissions'): Named[] {
+	return unwrapList(value, key).map(parseNamed);
 }
 
 /** GET `/session`. 401 is signed out; any other success is signed in. */
@@ -208,23 +219,23 @@ async function createNamed(path: string, name: string): Promise<string> {
 	return id;
 }
 
-/** GET `/users`. Renders id and email only. */
+/** GET `/users`. Body is `{ users: [{ id, email }] }`. Renders id and email only. */
 export async function listUsers(): Promise<User[]> {
 	const response = await get('/users');
 	if (!response.ok) throw new ApiError(response.status);
 	return parseUsers(await readJson(response));
 }
 
-/** GET `/groups`. Renders id and name only. */
+/** GET `/groups`. Body is `{ groups: [{ id, name }] }`. Renders id and name only. */
 export async function listGroups(): Promise<Named[]> {
 	const response = await get('/groups');
 	if (!response.ok) throw new ApiError(response.status);
-	return parseNamedList(await readJson(response));
+	return parseNamedList(await readJson(response), 'groups');
 }
 
-/** GET `/permissions`. Renders id and name only. */
+/** GET `/permissions`. Body is `{ permissions: [{ id, name }] }`. Renders id and name only. */
 export async function listPermissions(): Promise<Named[]> {
 	const response = await get('/permissions');
 	if (!response.ok) throw new ApiError(response.status);
-	return parseNamedList(await readJson(response));
+	return parseNamedList(await readJson(response), 'permissions');
 }
