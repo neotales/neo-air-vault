@@ -226,11 +226,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "neo-air-vault"
-version = "0.0.0-alpha.0"
-
-[[package]]
-name = "neo-air-vault-api"
+name = "navault-server"
 version = "0.0.0-alpha.0"
 dependencies = [
  "axum",

@@ -59,6 +59,11 @@ mod tests {
     use super::{Health, LISTEN_ADDR, router};
 
     #[test]
+    fn version_is_alpha() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.0.0-alpha.0");
+    }
+
+    #[test]
     fn listen_addr_is_loopback() {
         assert!(LISTEN_ADDR.ip().is_loopback());
         assert_eq!(LISTEN_ADDR.port(), 8787);

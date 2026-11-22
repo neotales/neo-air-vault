@@ -4,7 +4,7 @@
 
 use std::process::ExitCode;
 
-use neo_air_vault_api::{LISTEN_ADDR, serve};
+use navault_server::{LISTEN_ADDR, serve};
 
 #[tokio::main]
 async fn main() -> ExitCode {

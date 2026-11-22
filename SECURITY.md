@@ -1,7 +1,9 @@
 # Security
 
 This repository does not store or encrypt secrets yet. Do not deploy it.
-Do not treat a clean scan of the placeholder crate as a review of a vault.
+Do not treat a clean scan of the placeholder crate, or a healthy
+`navault-server` process, as a review of a vault. `/health` is not a
+secret API.
 
 ## Gates
 

@@ -1,6 +1,6 @@
 # Repository constraints
 
-Rust code lives in `crates/`. The human client lives in `web/`. The workspace
+Rust code lives in `server/`. The human client lives in `web/`. The workspace
 uses Rust 1.100, edition 2024, and the MIT license. `publish` stays false until
 a release is an explicit decision.
 

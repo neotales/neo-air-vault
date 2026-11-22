@@ -2,8 +2,7 @@
 
 neo-air-vault is a credential and secrets store for people, service accounts,
 and agents. It is not usable yet. This repository is the Rust workspace for
-that product. The crate in `crates/neo-air-vault` does not store or encrypt
-secrets.
+that product. `server/` does not store or encrypt secrets.
 
 It uses Rust 1.100 and is licensed under MIT.
 
@@ -33,7 +32,7 @@ pnpm dev
 The API, from this directory:
 
 ```sh
-cargo run -p neo-air-vault-api
+cargo run -p navault-server
 ```
 
 ## What this is not
