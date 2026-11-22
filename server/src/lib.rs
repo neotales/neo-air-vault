@@ -9,9 +9,7 @@
 
 mod auth;
 
-pub use auth::{
-    ADMIN_FILE, DEFAULT_DATABASE, KEY_FILE, KEY_LEN, Settings, StartupError, app, app_with,
-};
+pub use auth::{DEFAULT_DATABASE, KEY_FILE, KEY_LEN, Settings, StartupError, app, app_with};
 // The two header parsers are public so the fuzz target can call them; nothing
 // else in this module is exported.
 pub use auth::{cookie, origin_matches};
