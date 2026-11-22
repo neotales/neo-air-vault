@@ -1,0 +1,23 @@
+[package]
+name = "neotales-x-auth-core"
+version = "0.0.0-alpha.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+uuid = { version = "1", features = ["v7"] }
+time = "0.3"
+
+[features]
+oidc = ["social"]
+default = []
+password = []
+session = []
+social = []
+
+
+[lints]
+workspace = true
