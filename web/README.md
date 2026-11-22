@@ -1,11 +1,13 @@
 # neo-air-vault web
 
 SvelteKit, Tailwind CSS, and shadcn-svelte. pnpm. Node. This is the human
-client. It is not a vault and it does not store a secret.
+client. Its page signs in and manages users, groups, and permissions. It is
+not a vault and it does not store a secret.
 
-The API it may call is `navault-server` on `127.0.0.1:8787`. The only
-route is `/health`. A response of `{ "status": "ok", "vault": false }` means
-the process is up. It does not mean a vault exists.
+The API it may call is `navault-server` on `127.0.0.1:8787`. `/health`
+reports whether the process is up and returns `vault: false`; it is not the
+only route. The page also uses sign-in, session, and session-gated management
+routes. The process does not store secrets.
 
 ```sh
 pnpm install
