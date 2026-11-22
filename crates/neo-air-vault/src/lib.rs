@@ -12,6 +12,6 @@ mod tests {
 
     #[test]
     fn version_matches_the_workspace() {
-        assert_eq!(VERSION, "0.1.0");
+        assert_eq!(VERSION, "0.0.0-alpha.0");
     }
 }
