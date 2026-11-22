@@ -7,6 +7,10 @@ secrets.
 
 It uses Rust 1.100 and is licensed under MIT.
 
+The server binary is `navault-server`. The CLI binary will be `navault`.
+The human client is `web/`. Both are a shell. Neither stores a secret.
+`/health` reports `vault: false`. Do not point a workload at either.
+
 ## Build
 
 From this directory, with the pinned toolchain:
@@ -15,8 +19,22 @@ From this directory, with the pinned toolchain:
 cargo test --workspace --all-features --locked
 ```
 
-`cargo test` checks that the workspace builds. It does not test a vault,
-because there is no vault.
+`cargo test` checks that the workspace builds and that `/health` refuses to
+claim a vault. It does not test a vault, because there is no vault.
+
+The web shell, from `web/`:
+
+```sh
+pnpm install
+pnpm check
+pnpm dev
+```
+
+The API, from this directory:
+
+```sh
+cargo run -p neo-air-vault-api
+```
 
 ## What this is not
 

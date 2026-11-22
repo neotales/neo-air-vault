@@ -7,8 +7,9 @@ a release is an explicit decision.
 The web client is SvelteKit, Tailwind CSS, and shadcn-svelte, installed with
 pnpm on Node. It is not a second store. The API process is Axum. The binary is `navault-server`. It may listen
 on `127.0.0.1:8787` and answer `/health`. That listener is not a vault.
-The CLI, TUI, and desktop app are not this binary. The desktop app ships
-separately.
+The CLI binary is `navault`. It is not this process. The desktop app ships
+separately. The human client stays in `web/`. Do not invent a longer binary
+name.
 
 Do not add a cipher, a database, or a route that accepts or returns a secret
 until the milestone that names that step. A secret value must not be a bare
