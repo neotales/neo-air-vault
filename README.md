@@ -33,6 +33,7 @@ The API, from this directory:
 
 ```sh
 cargo run -p navault-server
+cargo build -p navault-server --features embed-ui
 ```
 
 ## What this is not

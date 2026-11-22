@@ -1,4 +1,4 @@
-/** Loopback API the shell is allowed to call. It is not a vault. */
+/** Loopback API when the page is not already served by navault-server. */
 export const API_ORIGIN = 'http://127.0.0.1:8787';
 
 export type Health = { kind: 'down' } | { kind: 'mismatch' } | { kind: 'not-a-vault' };

@@ -30,9 +30,60 @@ impl Health {
     }
 }
 
-/// Routes this process serves. `/health` is the only route.
+/// Routes this process serves. `/health` is always present.
+///
+/// The `embed-ui` feature also serves the built web client. That client is
+/// not a vault.
 pub fn router() -> Router {
-    Router::new().route("/health", get(health))
+    let router = Router::new().route("/health", get(health));
+    #[cfg(feature = "embed-ui")]
+    let router = router.fallback(ui::file);
+    router
+}
+
+#[cfg(feature = "embed-ui")]
+mod ui {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, StatusCode, Uri, header};
+    use axum::response::Response;
+    use include_dir::{Dir, include_dir};
+
+    static UI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../web/build");
+
+    pub async fn file(uri: Uri) -> Response {
+        let path = uri.path().trim_start_matches('/');
+        let path = if path.is_empty() { "index.html" } else { path };
+        if let Some(file) = UI.get_file(path) {
+            return response(StatusCode::OK, path, file.contents());
+        }
+        if let Some(index) = UI.get_file("index.html") {
+            return response(StatusCode::OK, "index.html", index.contents());
+        }
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .expect("empty response")
+    }
+
+    fn response(status: StatusCode, path: &str, bytes: &[u8]) -> Response {
+        let mut response = Response::builder().status(status);
+        if let Some(kind) = content_type(path) {
+            response = response.header(header::CONTENT_TYPE, HeaderValue::from_static(kind));
+        }
+        response.body(Body::from(bytes.to_vec())).expect("body")
+    }
+
+    fn content_type(path: &str) -> Option<&'static str> {
+        match path.rsplit('.').next() {
+            Some("html") => Some("text/html; charset=utf-8"),
+            Some("css") => Some("text/css; charset=utf-8"),
+            Some("js") => Some("text/javascript; charset=utf-8"),
+            Some("svg") => Some("image/svg+xml"),
+            Some("json") => Some("application/json"),
+            Some("txt") => Some("text/plain; charset=utf-8"),
+            _ => None,
+        }
+    }
 }
 
 async fn health() -> Json<Health> {

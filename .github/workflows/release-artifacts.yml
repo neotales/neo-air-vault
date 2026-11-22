@@ -1,0 +1,70 @@
+name: artifacts
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    name: server and ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@1.100.0
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build the static UI
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          NAV_UI=static pnpm build
+
+      - name: Build the server without the UI
+        run: cargo build --release --locked -p navault-server
+
+      - name: Keep the server without the UI
+        run: |
+          mkdir -p dist/navault-server
+          cp target/release/navault-server dist/navault-server/navault-server
+
+      - name: Build the server with the UI embedded
+        run: cargo build --release --locked -p navault-server --features embed-ui
+
+      - name: Pack tar and zip
+        run: |
+          set -eu
+          mkdir -p dist/navault-server-ui dist/ui
+          cp target/release/navault-server dist/navault-server-ui/navault-server
+          cp -a web/build/. dist/ui/
+          tar -C dist -czf dist/navault-server.tar.gz navault-server
+          tar -C dist -czf dist/navault-server-ui.tar.gz navault-server-ui
+          tar -C dist -czf dist/ui.tar.gz ui
+          (cd dist && zip -r navault-server.zip navault-server)
+          (cd dist && zip -r navault-server-ui.zip navault-server-ui)
+          (cd dist && zip -r ui.zip ui)
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: navault-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          retention-days: 5

@@ -19,7 +19,8 @@ From the repository root, using the pinned toolchain:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-- `cargo test --workspace --all-features --locked`
+- `cargo test --workspace --locked`
+- `cargo test --workspace --all-features --locked` when `web/build` exists
 - `cargo deny --all-features check`
 - `cargo audit`
 

@@ -4,9 +4,26 @@
 	import * as Card from '$lib/components/ui/card/index.js';
 	import * as Empty from '$lib/components/ui/empty/index.js';
 	import { Separator } from '$lib/components/ui/separator/index.js';
-	import type { PageProps } from './$types';
+	import { API_ORIGIN, parseHealth, type Health } from '$lib/health';
+	import { onMount } from 'svelte';
 
-	let { data }: PageProps = $props();
+	let health = $state<Health>({ kind: 'down' });
+
+	onMount(() => {
+		const origin = window.location.port === '8787' ? '' : API_ORIGIN;
+		void (async () => {
+			try {
+				const response = await fetch(`${origin}/health`, {
+					headers: { accept: 'application/json' },
+					redirect: 'error',
+					signal: AbortSignal.timeout(750)
+				});
+				health = response.ok ? parseHealth(await response.json()) : { kind: 'mismatch' };
+			} catch {
+				health = { kind: 'down' };
+			}
+		})();
+	});
 
 	const healthLabel = $derived(
 		data.health.kind === 'not-a-vault'
