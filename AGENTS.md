@@ -1,11 +1,18 @@
 # Repository constraints
 
-All code lives in `crates/`. The workspace uses Rust 1.100, edition 2024, and
-the MIT license. `publish` stays false until a release is an explicit decision.
+Rust code lives in `crates/`. The human client lives in `web/`. The workspace
+uses Rust 1.100, edition 2024, and the MIT license. `publish` stays false until
+a release is an explicit decision.
 
-This crate does not store secrets. Do not add a cipher, a database, or an HTTP
-server in a drive-by change. A secret value must not be a bare `String` once
-secret types exist. `unsafe` is forbidden.
+The web client is SvelteKit, Tailwind CSS, and shadcn-svelte, installed with
+pnpm on Node. It is not a second store. The API process is Axum. The binary is `navault-server`. It may listen
+on `127.0.0.1:8787` and answer `/health`. That listener is not a vault.
+The CLI, TUI, and desktop app are not this binary. The desktop app ships
+separately.
+
+Do not add a cipher, a database, or a route that accepts or returns a secret
+until the milestone that names that step. A secret value must not be a bare
+`String` once secret types exist. `unsafe` is forbidden.
 
 From the repository root, using the pinned toolchain:
 
