@@ -5,10 +5,13 @@ use axum::body::Body;
 use axum::http::request::Builder;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
-use serde_json::Value;
+use neotales_dbapi::{DbType, Parameter, Pool as _, QueryOptions, Value};
+use neotales_x_auth::{Auth, Policy, hash_password};
+use neotales_x_auth_core::{AuthError, AuthStore as _, Id, MembershipStatus, Timestamp};
+use serde_json::Value as Json;
 use tower::ServiceExt;
 
-use navault_server::{KEY_LEN, Settings, app_with};
+use navault_server::{ADMIN_FILE, KEY_LEN, Settings, app_with};
 
 /// A fresh 32-byte digest key for one temporary database.
 fn random_key() -> [u8; KEY_LEN] {
@@ -157,13 +160,84 @@ fn assert_no_secret_columns(body: &str) {
     }
 }
 
-fn users(body: &str) -> Vec<Value> {
-    let value: Value = serde_json::from_str(body).expect("json");
+fn users(body: &str) -> Vec<Json> {
+    let value: Json = serde_json::from_str(body).expect("json");
     value
         .get("users")
-        .and_then(Value::as_array)
+        .and_then(Json::as_array)
         .expect("users array")
         .clone()
+}
+
+/// The tenant and the first account, read directly from `database`.
+async fn tenant_and_first_user(database: &std::path::Path) -> (Id, Id) {
+    let store = neotales_x_auth_store_sqlite::open(database)
+        .await
+        .expect("store");
+    let tenant = store
+        .provider()
+        .fetch_first_async(
+            "SELECT id FROM auth_tenant ORDER BY created_at LIMIT 1",
+            QueryOptions::new(),
+        )
+        .await
+        .expect("tenant query")
+        .expect("tenant");
+    let tenant =
+        Id::from_slice(&tenant.read::<Vec<u8>>("id").expect("tenant id")).expect("valid tenant id");
+    let user = store
+        .provider()
+        .fetch_first_async(
+            "SELECT id FROM auth_user ORDER BY created_at LIMIT 1",
+            QueryOptions::new(),
+        )
+        .await
+        .expect("user query")
+        .expect("user");
+    let user =
+        Id::from_slice(&user.read::<Vec<u8>>("id").expect("user id")).expect("valid user id");
+    (tenant, user)
+}
+
+/// The stored membership status for `user`, or `None` when there is no row.
+async fn stored_membership(
+    database: &std::path::Path,
+    key: [u8; KEY_LEN],
+    tenant: Id,
+    user: Id,
+) -> Option<MembershipStatus> {
+    let store = neotales_x_auth_store_sqlite::open(database)
+        .await
+        .expect("store");
+    let auth = Auth::new(&store, key, Policy::default());
+    match auth.membership(tenant, user).await {
+        Ok(membership) => Some(membership.status),
+        Err(AuthError::NotFound) => None,
+        Err(error) => panic!("membership query failed: {error:?}"),
+    }
+}
+
+/// Mark `user` deleted, the way deleting the account leaves the row.
+async fn soft_delete_user(database: &std::path::Path, user: Id) {
+    let store = neotales_x_auth_store_sqlite::open(database)
+        .await
+        .expect("store");
+    let deleted_at = Parameter::new(
+        DbType::Text,
+        Value::Text("2020-01-01T00:00:00.000000000Z".to_owned()),
+    )
+    .expect("text parameter");
+    let id = Parameter::new(DbType::Bytes, Value::Bytes(user.as_bytes().to_vec()))
+        .expect("id parameter");
+    let affected = store
+        .provider()
+        .execute_async(
+            "UPDATE auth_user SET deleted_at=? WHERE id=?",
+            QueryOptions::new().bind(deleted_at).bind(id),
+        )
+        .await
+        .expect("soft delete");
+    assert_eq!(affected, 1, "one account is marked deleted");
 }
 
 #[tokio::test]
@@ -289,9 +363,6 @@ async fn a_store_with_a_user_ignores_the_administrator_settings() {
 
 #[tokio::test]
 async fn a_start_that_stopped_after_sign_up_finishes_the_administrator() {
-    use neotales_x_auth::{Auth, Policy, hash_password};
-    use neotales_x_auth_core::{AuthStore as _, Id, Timestamp};
-
     let directory = tempfile::tempdir().expect("temp dir");
     let database = directory.path().join("nav.sqlite");
     let key = random_key();
@@ -314,6 +385,10 @@ async fn a_start_that_stopped_after_sign_up_finishes_the_administrator() {
             .await
             .expect("user");
     }
+    assert!(
+        !directory.path().join(ADMIN_FILE).exists(),
+        "the stopped start left no marker"
+    );
 
     // The next start finishes the membership and the role; it does not create a
     // second user, and it does not need the administrator password again.
@@ -324,6 +399,10 @@ async fn a_start_that_stopped_after_sign_up_finishes_the_administrator() {
     )
     .await
     .expect("the application starts");
+    assert!(
+        directory.path().join(ADMIN_FILE).exists(),
+        "finishing access writes the marker"
+    );
 
     let mut client = Client::new(router);
     client.issue_csrf().await;
@@ -337,12 +416,168 @@ async fn a_start_that_stopped_after_sign_up_finishes_the_administrator() {
 
     // A second membership for the same user is a conflict, which proves the
     // start completed the missing membership and the caller may act.
-    let user_id = listed[0]
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("user id");
+    let user_id = listed[0].get("id").and_then(Json::as_str).expect("user id");
     let (status, body) = client
         .post("/memberships", &format!(r#"{{"user_id":"{user_id}"}}"#))
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    let marker = std::fs::read_to_string(directory.path().join(ADMIN_FILE)).expect("marker");
+    assert_eq!(
+        marker.trim(),
+        user_id,
+        "the marker records the administrator"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_membership_stays_revoked_on_the_next_open() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let database = directory.path().join("nav.sqlite");
+    let key = random_key();
+    let admin_password = random_password();
+
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("admin@example.test", &admin_password),
+    )
+    .await
+    .expect("the first start");
+    drop(router);
+    assert!(
+        directory.path().join(ADMIN_FILE).exists(),
+        "the first start writes the marker"
+    );
+
+    let (tenant, user) = tenant_and_first_user(&database).await;
+    {
+        let store = neotales_x_auth_store_sqlite::open(&database)
+            .await
+            .expect("store");
+        let auth = Auth::new(&store, key, Policy::default());
+        let membership = auth.membership(tenant, user).await.expect("membership");
+        auth.set_membership_status(
+            membership.id,
+            MembershipStatus::Suspended,
+            Timestamp::now_utc(),
+        )
+        .await
+        .expect("suspend");
+    }
+
+    // The marker makes the next start leave the suspension alone.
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("other@example.test", random_password()),
+    )
+    .await
+    .expect("the next start");
+    drop(router);
+
+    assert_eq!(
+        stored_membership(&database, key, tenant, user).await,
+        Some(MembershipStatus::Suspended),
+        "a revoked membership is not reactivated"
+    );
+}
+
+#[tokio::test]
+async fn a_store_with_memberships_adopts_the_existing_administrator() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let database = directory.path().join("nav.sqlite");
+    let key = random_key();
+    let admin_password = random_password();
+
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("admin@example.test", &admin_password),
+    )
+    .await
+    .expect("the first start");
+    drop(router);
+    let (tenant, administrator) = tenant_and_first_user(&database).await;
+
+    // A store that finished access before the marker existed has memberships
+    // and no marker. The next start records the user who already holds admin.
+    std::fs::remove_file(directory.path().join(ADMIN_FILE)).expect("remove marker");
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("other@example.test", random_password()),
+    )
+    .await
+    .expect("the next start");
+    drop(router);
+
+    let marker = std::fs::read_to_string(directory.path().join(ADMIN_FILE)).expect("marker");
+    assert_eq!(marker.trim(), administrator.to_string());
+    assert_eq!(
+        stored_membership(&database, key, tenant, administrator).await,
+        Some(MembershipStatus::Active),
+        "adoption changes no status"
+    );
+}
+
+#[tokio::test]
+async fn a_later_open_does_not_promote_a_second_user() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let database = directory.path().join("nav.sqlite");
+    let key = random_key();
+    let admin_password = random_password();
+
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("admin@example.test", &admin_password),
+    )
+    .await
+    .expect("the first start");
+    drop(router);
+    let (tenant, administrator) = tenant_and_first_user(&database).await;
+
+    // A second live account with no membership at all.
+    let second = {
+        let store = neotales_x_auth_store_sqlite::open(&database)
+            .await
+            .expect("store");
+        let hash = hash_password(random_password().as_bytes()).expect("hash");
+        Auth::new(&store, key, Policy::default())
+            .sign_up(tenant, "second@example.test", &hash, Timestamp::now_utc())
+            .await
+            .expect("second user")
+    };
+    assert_eq!(
+        stored_membership(&database, key, tenant, second.id).await,
+        None,
+        "the second user starts without a membership"
+    );
+
+    // Delete the original administrator; the marker still names it.
+    soft_delete_user(&database, administrator).await;
+
+    // The next start is the first live user's chance to be promoted, which the
+    // marker must refuse: it names the deleted administrator, not this user.
+    let router = app_with(
+        Settings::new(&database)
+            .with_key(key)
+            .with_admin("third@example.test", random_password()),
+    )
+    .await
+    .expect("the later start");
+    drop(router);
+
+    assert_eq!(
+        stored_membership(&database, key, tenant, second.id).await,
+        None,
+        "a later start does not promote a different user"
+    );
+    let marker = std::fs::read_to_string(directory.path().join(ADMIN_FILE)).expect("marker");
+    assert_eq!(
+        marker.trim(),
+        administrator.to_string(),
+        "the marker still names the original administrator"
+    );
 }

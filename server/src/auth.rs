@@ -42,6 +42,13 @@ pub const DEFAULT_DATABASE: &str = "nav.sqlite";
 /// `NAV_AUTH_KEY` is not set.
 pub const KEY_FILE: &str = "auth.key";
 
+/// File beside the database that records the bootstrapped administrator's user
+/// id.
+///
+/// It is written after that user's membership and admin role are in place, and
+/// its presence stops every later start from changing memberships or roles.
+pub const ADMIN_FILE: &str = "auth.admin";
+
 /// Length in bytes of the session and proof digest key.
 pub const KEY_LEN: usize = 32;
 
@@ -133,7 +140,7 @@ pub enum StartupError {
     Task,
     /// Binding or serving the listener failed.
     Listen(std::io::Error),
-    /// A key file operation failed.
+    /// A file beside the database could not be read or written.
     Io(std::io::Error),
 }
 
@@ -149,7 +156,7 @@ impl fmt::Display for StartupError {
             Self::Query => "a startup query failed",
             Self::Task => "the password hasher task failed",
             Self::Listen(_) => "the listener failed",
-            Self::Io(_) => "a key file operation failed",
+            Self::Io(_) => "a file beside the database could not be read or written",
         };
         formatter.write_str(message)
     }
@@ -208,6 +215,10 @@ pub async fn app() -> Result<Router, StartupError> {
 /// `embed-ui` file handler is set after these routes, so it answers only paths
 /// no route matched. It serves a built file, or `index.html` for `/` and an
 /// empty path. Any other missing path is 404.
+///
+/// The first administrator is bootstrapped once. `auth.admin` beside the
+/// database records that user's id after the membership and the admin role are
+/// written, and a start that finds it changes no memberships or roles.
 ///
 /// # Errors
 ///
@@ -279,25 +290,57 @@ struct Shared {
     key: Zeroizing<[u8; KEY_LEN]>,
 }
 
-/// Ensure the store has a tenant and a bootstrapped administrator with active
-/// membership and the admin role.
+/// Ensure the store has a tenant and, once, a bootstrapped administrator.
 ///
-/// The administrator variables are consulted only when `auth_user` is empty.
-/// The password is hashed on a blocking executor; neither it nor the hash is
-/// printed.
+/// The marker file [`ADMIN_FILE`] beside the database records the administrator
+/// user id. It is written only after the membership and the admin role are in
+/// place, and its presence makes every later start leave memberships and roles
+/// alone. That keeps a revoked membership revoked and stops a deleted
+/// administrator from being replaced by whoever is first now.
 ///
-/// A store that already has a user skips the variables, but not the rest of the
-/// setup: if the first live user exists without an active membership or without
-/// the admin role, those steps are finished on this start. A failed start after
-/// `sign_up` therefore recovers instead of leaving an administrator that cannot
-/// act. No second user is created.
+/// Without the marker:
+///
+/// * an empty store creates the administrator from the settings or the
+///   environment, grants access, and writes the marker;
+/// * a store with exactly one live user who has no membership finishes that
+///   user's access and writes the marker. This is the only recovery path, and it
+///   exists so a start that stopped after `sign_up` can be completed;
+/// * otherwise the marker is written for the earliest live user who already
+///   holds the admin role, without changing any status. If no user holds that
+///   role, nothing is granted and no user is chosen.
+///
+/// The password, when it is used at all, is hashed on a blocking executor and
+/// neither it nor the hash is printed.
 async fn bootstrap(
     store: &SqliteStore,
     settings: &Settings,
     key: [u8; KEY_LEN],
 ) -> Result<Id, StartupError> {
-    let provider = store.provider();
-    let tenant = provider
+    let tenant = tenant_for(store).await?;
+
+    // The marker is the decision. Once it exists, this start changes nothing
+    // about who belongs or who is an administrator.
+    if admin_marker_exists(&settings.database)? {
+        return Ok(tenant);
+    }
+
+    if count_users(store, tenant).await? == 0 {
+        create_administrator(store, settings, key, tenant).await?;
+        return Ok(tenant);
+    }
+
+    if recover_single_user(store, settings, key, tenant).await? {
+        return Ok(tenant);
+    }
+
+    adopt_existing_administrator(store, settings, tenant).await?;
+    Ok(tenant)
+}
+
+/// Load the first tenant, creating it on a store that has none.
+async fn tenant_for(store: &SqliteStore) -> Result<Id, StartupError> {
+    let tenant = store
+        .provider()
         .fetch_first_async(
             "SELECT id FROM auth_tenant ORDER BY created_at LIMIT 1",
             QueryOptions::new(),
@@ -306,42 +349,84 @@ async fn bootstrap(
         .map_err(|_| StartupError::Query)?
         .map(|row| read_id(&row).map_err(|_| StartupError::Query))
         .transpose()?;
-    let tenant = if let Some(tenant) = tenant {
-        tenant
-    } else {
-        let tenant = Id::now_v7();
-        store
-            .create_tenant(tenant, TENANT_NAME, Timestamp::now_utc())
-            .await?;
-        tenant
-    };
+    if let Some(tenant) = tenant {
+        return Ok(tenant);
+    }
+    let tenant = Id::now_v7();
+    store
+        .create_tenant(tenant, TENANT_NAME, Timestamp::now_utc())
+        .await?;
+    Ok(tenant)
+}
 
-    let users = provider
-        .fetch_first_async("SELECT COUNT(*) AS n FROM auth_user", QueryOptions::new())
+/// Number of accounts in `tenant`, whether live or deleted.
+async fn count_users(store: &SqliteStore, tenant: Id) -> Result<i64, StartupError> {
+    store
+        .provider()
+        .fetch_first_async(
+            "SELECT COUNT(*) AS n FROM auth_user WHERE tenant_id=?",
+            QueryOptions::new().bind(id_parameter(tenant)),
+        )
         .await
         .map_err(|_| StartupError::Query)?
         .ok_or(StartupError::Query)?
         .read::<i64>("n")
-        .map_err(|_| StartupError::Query)?;
-    if users > 0 {
-        // The bootstrap administrator is the first live user. If an earlier start
-        // stopped after `sign_up`, this is the user it created; completing the
-        // membership and role is idempotent on a store that finished setup.
-        let user = provider
-            .fetch_first_async(
-                "SELECT id FROM auth_user WHERE deleted_at IS NULL ORDER BY created_at LIMIT 1",
-                QueryOptions::new(),
-            )
-            .await
-            .map_err(|_| StartupError::Query)?
-            .map(|row| read_id(&row).map_err(|_| StartupError::Query))
-            .transpose()?;
-        if let Some(user) = user {
-            ensure_administrator_access(store, tenant, user, key).await?;
-        }
-        return Ok(tenant);
-    }
+        .map_err(|_| StartupError::Query)
+}
 
+/// Number of accounts in `tenant` that are not deleted.
+async fn count_live_users(store: &SqliteStore, tenant: Id) -> Result<i64, StartupError> {
+    store
+        .provider()
+        .fetch_first_async(
+            "SELECT COUNT(*) AS n FROM auth_user WHERE tenant_id=? AND deleted_at IS NULL",
+            QueryOptions::new().bind(id_parameter(tenant)),
+        )
+        .await
+        .map_err(|_| StartupError::Query)?
+        .ok_or(StartupError::Query)?
+        .read::<i64>("n")
+        .map_err(|_| StartupError::Query)
+}
+
+/// The first live account in `tenant`.
+async fn first_live_user(store: &SqliteStore, tenant: Id) -> Result<Option<Id>, StartupError> {
+    store
+        .provider()
+        .fetch_first_async(
+            "SELECT id FROM auth_user WHERE tenant_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1",
+            QueryOptions::new().bind(id_parameter(tenant)),
+        )
+        .await
+        .map_err(|_| StartupError::Query)?
+        .map(|row| read_id(&row).map_err(|_| StartupError::Query))
+        .transpose()
+}
+
+/// Whether `user` has any membership in `tenant`, whatever its status.
+async fn has_membership(store: &SqliteStore, tenant: Id, user: Id) -> Result<bool, StartupError> {
+    let membership = store
+        .provider()
+        .fetch_first_async(
+            "SELECT id FROM auth_membership WHERE tenant_id=? AND user_id=? LIMIT 1",
+            QueryOptions::new()
+                .bind(id_parameter(tenant))
+                .bind(id_parameter(user)),
+        )
+        .await
+        .map_err(|_| StartupError::Query)?;
+    Ok(membership.is_some())
+}
+
+/// Create the administrator on an empty store: settings first, then the
+/// environment. The password is hashed away from the async worker, and neither
+/// it nor the hash is printed.
+async fn create_administrator(
+    store: &SqliteStore,
+    settings: &Settings,
+    key: [u8; KEY_LEN],
+    tenant: Id,
+) -> Result<(), StartupError> {
     let admin = match &settings.admin {
         Some(admin) => Admin {
             email: admin.email.clone(),
@@ -354,12 +439,66 @@ async fn bootstrap(
         .await
         .map_err(|_| StartupError::Task)?
         .map_err(StartupError::Auth)?;
-
     let user = Auth::new(store, key, Policy::default())
         .sign_up(tenant, &email, &hash, Timestamp::now_utc())
         .await?;
     ensure_administrator_access(store, tenant, user.id, key).await?;
-    Ok(tenant)
+    write_admin_marker(&settings.database, user.id)
+}
+
+/// The only recovery path: one live user, no membership at all, and no marker.
+/// A start that stopped after `sign_up` left exactly that. A suspended
+/// membership is not missing and is not reactivated.
+///
+/// Returns whether access was finished and the marker written.
+async fn recover_single_user(
+    store: &SqliteStore,
+    settings: &Settings,
+    key: [u8; KEY_LEN],
+    tenant: Id,
+) -> Result<bool, StartupError> {
+    if count_live_users(store, tenant).await? != 1 {
+        return Ok(false);
+    }
+    let Some(user) = first_live_user(store, tenant).await? else {
+        return Ok(false);
+    };
+    if has_membership(store, tenant, user).await? {
+        return Ok(false);
+    }
+    ensure_administrator_access(store, tenant, user, key).await?;
+    write_admin_marker(&settings.database, user)?;
+    Ok(true)
+}
+
+/// Adopt a store that already has memberships but no marker, as it is.
+///
+/// The marker records the earliest live user who already holds the admin role.
+/// Nothing is granted and nobody else is chosen when no user holds it.
+async fn adopt_existing_administrator(
+    store: &SqliteStore,
+    settings: &Settings,
+    tenant: Id,
+) -> Result<(), StartupError> {
+    let user = store
+        .provider()
+        .fetch_first_async(
+            "SELECT u.id FROM auth_user u \
+             JOIN auth_membership m ON m.user_id=u.id AND m.tenant_id=u.tenant_id \
+             JOIN auth_membership_role mr ON mr.membership_id=m.id \
+             JOIN auth_role r ON r.id=mr.role_id AND r.tenant_id=u.tenant_id \
+             WHERE u.tenant_id=? AND u.deleted_at IS NULL AND r.name='admin' \
+             ORDER BY u.created_at LIMIT 1",
+            QueryOptions::new().bind(id_parameter(tenant)),
+        )
+        .await
+        .map_err(|_| StartupError::Query)?
+        .map(|row| read_id(&row).map_err(|_| StartupError::Query))
+        .transpose()?;
+    if let Some(user) = user {
+        write_admin_marker(&settings.database, user)?;
+    }
+    Ok(())
 }
 
 /// Give `user` an active membership in `tenant` and the tenant's `admin` role.
@@ -429,13 +568,54 @@ fn decode_hex(value: &str) -> Option<[u8; KEY_LEN]> {
     Some(key)
 }
 
-/// The key file next to the database.
-fn key_path(database: &Path) -> PathBuf {
+/// A file's path in the database's directory.
+fn beside_database(database: &Path, file: &str) -> PathBuf {
     let parent = database
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    parent.join(KEY_FILE)
+    parent.join(file)
+}
+
+/// The key file next to the database.
+fn key_path(database: &Path) -> PathBuf {
+    beside_database(database, KEY_FILE)
+}
+
+/// The administrator marker next to the database.
+fn admin_path(database: &Path) -> PathBuf {
+    beside_database(database, ADMIN_FILE)
+}
+
+/// Whether the administrator marker exists.
+///
+/// A missing marker is `Ok(false)`; any other metadata error is reported rather
+/// than treated as missing, so a start cannot decide to mutate access because
+/// it could not read the directory.
+fn admin_marker_exists(database: &Path) -> Result<bool, StartupError> {
+    match std::fs::metadata(admin_path(database)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StartupError::Io(error)),
+    }
+}
+
+/// Write the administrator user id, atomically, so a partial marker cannot
+/// claim that access was granted when it was not.
+fn write_admin_marker(database: &Path, user: Id) -> Result<(), StartupError> {
+    let path = admin_path(database);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(StartupError::Io)?;
+    }
+    let temporary = path.with_file_name(format!("{ADMIN_FILE}.tmp"));
+    let mut file = std::fs::File::create(&temporary).map_err(StartupError::Io)?;
+    file.write_all(user.to_string().as_bytes())
+        .map_err(StartupError::Io)?;
+    file.sync_all().map_err(StartupError::Io)?;
+    drop(file);
+    std::fs::rename(&temporary, &path).map_err(StartupError::Io)
 }
 
 /// Read the key file, or create it with 32 random bytes.
