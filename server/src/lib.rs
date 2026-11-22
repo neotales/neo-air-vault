@@ -2,6 +2,14 @@
 //!
 //! This crate does not store, encrypt, wrap, or return secrets. A successful
 //! health response means the process is running. It does not mean a vault exists.
+//!
+//! [`app`] adds the authenticated application: accounts, groups, permissions,
+//! and memberships kept in SQLite through `neotales-x-auth-store-sqlite`. That
+//! is identity data, not secret material; the store is not a vault either.
+
+mod auth;
+
+pub use auth::{DEFAULT_DATABASE, KEY_FILE, KEY_LEN, Settings, StartupError, app, app_with};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -30,10 +38,11 @@ impl Health {
     }
 }
 
-/// Routes this process serves. `/health` is always present.
+/// Routes this process serves without a store. `/health` is always present.
 ///
 /// The `embed-ui` feature also serves the built web client. That client is
-/// not a vault.
+/// not a vault. [`app`] mounts this health route together with the auth routes
+/// and sets the UI fallback last, so it answers only unmatched paths.
 pub fn router() -> Router {
     let router = Router::new().route("/health", get(health));
     #[cfg(feature = "embed-ui")]
@@ -86,18 +95,24 @@ mod ui {
     }
 }
 
-async fn health() -> Json<Health> {
+pub(crate) async fn health() -> Json<Health> {
     Json(Health::not_a_vault())
 }
 
-/// Bind [`LISTEN_ADDR`] and serve [`router`]. This does not open a store.
+/// Open the store, bootstrap the tenant and administrator, bind [`LISTEN_ADDR`],
+/// and serve [`app`].
 ///
 /// # Errors
 ///
-/// Returns the listener error. The error is an address or I/O failure, not a secret.
-pub async fn serve() -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(LISTEN_ADDR).await?;
-    axum::serve(listener, router()).await
+/// Returns [`StartupError`] when the store, key, bootstrap, or listener fails.
+/// No error message contains a password or a digest key.
+pub async fn serve() -> Result<(), StartupError> {
+    let listener = tokio::net::TcpListener::bind(LISTEN_ADDR)
+        .await
+        .map_err(StartupError::Listen)?;
+    axum::serve(listener, app().await?)
+        .await
+        .map_err(StartupError::Listen)
 }
 
 #[cfg(test)]

@@ -624,7 +624,7 @@ async fn the_session_token_is_only_in_the_cookie() {
     assert_eq!(status, StatusCode::OK);
 
     let token = set_cookie(&headers, "neotales.session").expect("session cookie");
-    assert!(!token.is_empty());
+    assert_ne!(token, "");
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(
         !text.contains(&token),
@@ -1530,7 +1530,7 @@ async fn invitation_issue_delivers_the_token_and_returns_none() {
     assert_eq!(received.len(), 1, "the hook receives the invitation token");
     assert_eq!(received[0].0, "invite@example.test");
     assert_eq!(received[0].1, TokenKind::Invitation);
-    assert!(!received[0].2.is_empty());
+    assert_ne!(received[0].2, "");
 
     let text = String::from_utf8(bytes).expect("utf-8");
     let parsed: Value = serde_json::from_str(&text).expect("json");
@@ -1635,7 +1635,7 @@ async fn email_sign_in_issues_a_session_once_and_keeps_the_token_out_of_the_body
         );
         assert_eq!(received[0].1, TokenKind::EmailSignIn);
         let token = received[0].2.clone();
-        assert!(!token.is_empty());
+        assert_ne!(token, "");
         assert!(
             !text.contains(&token),
             "the proof token never reaches the response body: {text}"

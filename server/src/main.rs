@@ -1,6 +1,7 @@
-//! Process entry for the loopback health listener.
+//! Process entry for the loopback health listener and auth routes.
 //!
-//! Starting this binary does not create a vault.
+//! Starting this binary does not create a vault. It does open the auth store and
+//! ensure a tenant and administrator exist.
 
 use std::process::ExitCode;
 
@@ -13,7 +14,7 @@ async fn main() -> ExitCode {
     match serve().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("listener failed: {error}");
+            eprintln!("navault-server failed: {error}");
             ExitCode::FAILURE
         }
     }
