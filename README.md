@@ -16,11 +16,11 @@ The human client is `web/`. Neither stores a secret. `/health` reports
 From this directory, with the pinned toolchain:
 
 ```sh
-cargo test --workspace --all-features --locked
+cargo test --workspace --locked
 ```
 
-`cargo test` checks that the workspace builds and that `/health` refuses to
-claim a vault. It does not test a vault, because there is no vault.
+This default test gate checks the workspace without enabling the `embed-ui`
+fallback.
 
 The web shell, from `web/`:
 
@@ -50,11 +50,12 @@ Anonymous state-changing requests are refused except for `POST /sign-in`.
 
 ## What this is not
 
-- Not a password manager you can log in to.
+- Not a vault: callers can sign in and manage accounts, groups, and
+  permissions, but the process does not store secrets.
 - Not a FIPS-validated module.
-- Not post-quantum safe. No cryptographic algorithm is implemented here.
+- Not a post-quantum-secure vault.
 - Not a client for Bitwarden, 1Password, KeePass, Vault, OpenBao, Azure Key
   Vault, Dashlane, Proton Pass, Infisical, or Vaultwarden.
 
-The first implementation has not started. Do not point a workload at this
-repository.
+Vault storage and secret-management functionality have not been implemented.
+Do not point a workload at this repository.
